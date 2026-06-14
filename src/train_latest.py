@@ -24,14 +24,13 @@ from diffusers import (
 )
 from transformers import CLIPTextModel, CLIPTokenizer
 
-# ── Paths ──────────────────────────────────────────────────────────────────
+
 CSV_PATH   = os.environ.get("CSV_PATH",   "/workspace/captions.csv")
 IMAGE_ROOT = os.environ.get("IMAGE_ROOT", "/workspace/flickr30k-images")
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/workspace/outputs"))
 CKPT_DIR   = OUTPUT_DIR / "checkpoints"
 INFER_DIR  = OUTPUT_DIR / "inference"
 
-# ── Hyperparameters ─────────────────────────────────────────────────────────
 NUM_IMAGES       = int(os.environ.get("NUM_IMAGES",       "10000"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",       "8"))
 NUM_EPOCHS       = int(os.environ.get("NUM_EPOCHS",       "50"))
@@ -44,7 +43,7 @@ EMA_DECAY        = float(os.environ.get("EMA_DECAY",      "0.9995"))
 SNR_GAMMA        = float(os.environ.get("SNR_GAMMA",      "5.0"))
 EARLY_STOP_PAT   = int(os.environ.get("EARLY_STOP_PAT",   "8"))
 
-# ── Model config ────────────────────────────────────────────────────────────
+
 SD_ID      = "runwayml/stable-diffusion-v1-5"
 CN_ID      = "lllyasviel/sd-controlnet-canny"
 DTYPE      = torch.float32
@@ -54,14 +53,10 @@ VAE_SCALE  = 0.18215
 GRID_SIZE  = 8
 TEXT_DIM   = 768
 
-# down_blocks.3 + mid_block = ~28M params
-# Sweet spot: enough capacity for PSNR>18, not enough to overfit 10k images
 TRAIN_CN_BLOCKS = {"down_blocks.3", "mid_block"}
 
 
-###########################################################################
 # EMA
-###########################################################################
 
 class EMA:
     """
@@ -88,9 +83,7 @@ class EMA:
         self.shadow.load_state_dict(sd)
 
 
-###########################################################################
 # SNR WEIGHTING
-###########################################################################
 
 def compute_snr(scheduler, timesteps):
     """
@@ -121,9 +114,7 @@ def snr_weighted_loss(pred, target, timesteps, scheduler, gamma=5.0):
     return (loss * weights).mean()
 
 
-###########################################################################
 # DATASET
-###########################################################################
 
 class FlickrSketchDataset(Dataset):
     def __init__(self, csv_path: str, image_root: str, max_samples: int = None):
@@ -182,11 +173,8 @@ def make_loader(csv_path, image_root, batch_size, num_workers, max_samples=None)
         num_workers=num_workers, pin_memory=True,
         drop_last=True, persistent_workers=(num_workers > 0),
     )
-
-
-###########################################################################
+    
 # REGION ATTENTION MODULES
-###########################################################################
 
 class RegionExtractor(nn.Module):
     def __init__(self, in_ch=1280, embed_dim=TEXT_DIM, grid=GRID_SIZE):
@@ -375,11 +363,6 @@ def load_checkpoint(m, ema_cn, opt, resume_path, device):
           f"MSE: {ckpt.get('metrics', {}).get('MSE', 'N/A')}")
     return epoch
 
-
-###########################################################################
-# METRICS
-###########################################################################
-
 def compute_metrics(pred, target):
     p    = pred.float().detach()
     t    = target.float().detach()
@@ -431,11 +414,6 @@ def print_metrics(metrics_log, final, nan_count, train_time,
         print(f"  {k:<30} {v}")
     print("=" * W)
 
-
-###########################################################################
-# TIMESTEP SAMPLING
-###########################################################################
-
 def sample_timesteps(bs, device, total=1000, bias=TIMESTEP_BIAS):
     n_low  = int(bs * bias)
     n_high = bs - n_low
@@ -443,11 +421,6 @@ def sample_timesteps(bs, device, total=1000, bias=TIMESTEP_BIAS):
     high   = torch.randint(total // 2, total, (n_high,), device=device)
     ts     = torch.cat([low, high])
     return ts[torch.randperm(bs, device=device)]
-
-
-###########################################################################
-# INFERENCE  (uses EMA weights for better quality)
-###########################################################################
 
 def run_inference(m, ema_cn, sched, device, sample_batch, epoch):
     INFER_DIR.mkdir(parents=True, exist_ok=True)
@@ -487,11 +460,6 @@ def run_inference(m, ema_cn, sched, device, sample_batch, epoch):
     sketch_pil.save(str(inp))
     print(f"[INFERENCE] Saved → {out}")
     return str(out)
-
-
-###########################################################################
-# MAIN
-###########################################################################
 
 def main():
     print("=" * 60)
