@@ -1,21 +1,4 @@
-"""
-train.py -- Dual-Stage Region-Aware Sketch-to-Image Diffusion
-=============================================================
-Changes from v1 (loss=0.63) to push loss < 0.1:
-  1. RESUME FROM CHECKPOINT: continues from last saved epoch, no restart
-  2. EPOCHS: 5 → 20 (more training time)
-  3. LR: 1e-4 → 3e-5 (finer convergence at later epochs)
-  4. CAPTION FILTERING: removes short/noisy captions < 8 words
-  5. SAMPLE FILTERING: skips low-contrast/blank images (std < 0.05)
-  6. GRAD ACCUM: 2 → 4 (effective batch = 32, smoother gradients)
-  7. TIGHTER TIMESTEP BIAS: 0.7 → 0.8 (80% low-noise steps)
-  8. PARAM REDUCTION: only mid_block trained (~5M vs 302M before)
-     This is the biggest change — 302M params on Visual Genome data
-     was severe overfitting. Mid_block only = less overfitting = lower loss.
-  9. LR WARMUP: 200 step linear warmup before cosine decay
-"""
-
-import json
+import copy
 import math
 import os
 import time
@@ -28,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
@@ -41,24 +24,27 @@ from diffusers import (
 )
 from transformers import CLIPTextModel, CLIPTokenizer
 
-# ── Paths ─────────────────────────────────────────────────────────────────
+# ── Paths ──────────────────────────────────────────────────────────────────
 CSV_PATH   = os.environ.get("CSV_PATH",   "/workspace/captions.csv")
 IMAGE_ROOT = os.environ.get("IMAGE_ROOT", "/workspace/flickr30k-images")
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/workspace/outputs"))
 CKPT_DIR   = OUTPUT_DIR / "checkpoints"
 INFER_DIR  = OUTPUT_DIR / "inference"
 
-# ── Hyperparameters ────────────────────────────────────────────────────────
+# ── Hyperparameters ─────────────────────────────────────────────────────────
 NUM_IMAGES       = int(os.environ.get("NUM_IMAGES",       "10000"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",       "8"))
-NUM_EPOCHS       = int(os.environ.get("NUM_EPOCHS",       "20"))   # CHANGE: 5→20
-LR               = float(os.environ.get("LR",             "3e-5")) # CHANGE: 1e-4→3e-5
-GRAD_ACCUM_STEPS = int(os.environ.get("GRAD_ACCUM_STEPS", "4"))    # CHANGE: 2→4
+NUM_EPOCHS       = int(os.environ.get("NUM_EPOCHS",       "50"))
+LR               = float(os.environ.get("LR",             "5e-5"))
+GRAD_ACCUM_STEPS = int(os.environ.get("GRAD_ACCUM_STEPS", "4"))
 NUM_WORKERS      = int(os.environ.get("NUM_WORKERS",      "4"))
-TIMESTEP_BIAS    = float(os.environ.get("TIMESTEP_BIAS",  "0.8"))  # CHANGE: 0.7→0.8
-RESUME_CKPT      = os.environ.get("RESUME_CKPT",          "")      # CHANGE: checkpoint resume path
+TIMESTEP_BIAS    = float(os.environ.get("TIMESTEP_BIAS",  "0.8"))
+RESUME_CKPT      = os.environ.get("RESUME_CKPT",          "")
+EMA_DECAY        = float(os.environ.get("EMA_DECAY",      "0.9995"))
+SNR_GAMMA        = float(os.environ.get("SNR_GAMMA",      "5.0"))
+EARLY_STOP_PAT   = int(os.environ.get("EARLY_STOP_PAT",   "8"))
 
-# ── Model config ───────────────────────────────────────────────────────────
+# ── Model config ────────────────────────────────────────────────────────────
 SD_ID      = "runwayml/stable-diffusion-v1-5"
 CN_ID      = "lllyasviel/sd-controlnet-canny"
 DTYPE      = torch.float32
@@ -68,25 +54,88 @@ VAE_SCALE  = 0.18215
 GRID_SIZE  = 8
 TEXT_DIM   = 768
 
-# CHANGE: only mid_block (~5M params) instead of last 2 blocks + mid (~302M)
-# 302M params on small dataset = massive overfitting = high loss
-# mid_block only = highest semantic impact, least overfitting
-TRAIN_CN_BLOCKS = {"mid_block"}
+# down_blocks.3 + mid_block = ~28M params
+# Sweet spot: enough capacity for PSNR>18, not enough to overfit 10k images
+TRAIN_CN_BLOCKS = {"down_blocks.3", "mid_block"}
 
 
 ###########################################################################
-# DATASET  with caption + image filtering
+# EMA
+###########################################################################
+
+class EMA:
+    """
+    Exponential Moving Average of model weights.
+    Keeps a shadow copy of weights that updates slowly.
+    EMA weights used for inference = smoother, higher quality outputs.
+    """
+    def __init__(self, model, decay=0.9995):
+        self.decay  = decay
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        for s_param, param in zip(self.shadow.parameters(), model.parameters()):
+            s_param.data.mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+
+    def state_dict(self):
+        return self.shadow.state_dict()
+
+    def load_state_dict(self, sd):
+        self.shadow.load_state_dict(sd)
+
+
+###########################################################################
+# SNR WEIGHTING
+###########################################################################
+
+def compute_snr(scheduler, timesteps):
+    """
+    Min-SNR weighting (Hang et al., 2023).
+    Weights loss by signal-to-noise ratio clamped at gamma.
+    Prevents high-noise timesteps from dominating gradients.
+    """
+    alphas_bar = scheduler.alphas_cumprod
+    sqrt_alphas_bar     = alphas_bar ** 0.5
+    sqrt_one_minus_ab   = (1 - alphas_bar) ** 0.5
+
+    alpha_t = sqrt_alphas_bar[timesteps].to(timesteps.device)
+    sigma_t = sqrt_one_minus_ab[timesteps].to(timesteps.device)
+    snr     = (alpha_t / sigma_t) ** 2
+    return snr
+
+
+def snr_weighted_loss(pred, target, timesteps, scheduler, gamma=5.0):
+    """
+    MSE loss weighted by min(SNR, gamma) / SNR.
+    Low-SNR (high noise) steps get down-weighted.
+    High-SNR (low noise) steps get full weight.
+    """
+    snr     = compute_snr(scheduler, timesteps)
+    weights = torch.clamp(snr, max=gamma) / snr
+    weights = weights.view(-1, 1, 1, 1).to(pred.device)
+    loss    = F.mse_loss(pred.float(), target.float(), reduction="none")
+    return (loss * weights).mean()
+
+
+###########################################################################
+# DATASET
 ###########################################################################
 
 class FlickrSketchDataset(Dataset):
     def __init__(self, csv_path: str, image_root: str, max_samples: int = None):
         df = pd.read_csv(csv_path)
 
-        # CHANGE: filter noisy/short captions (< 8 words)
-        df["word_count"] = df["caption"].astype(str).apply(lambda x: len(x.split()))
-        df = df[df["word_count"] >= 8].reset_index(drop=True)
-        print(f"[Dataset] After caption filter: {len(df)} samples")
+        # Filter: >= 10 words, no generic Visual Genome placeholders
+        df["wc"] = df["caption"].astype(str).apply(lambda x: len(x.split()))
+        df = df[df["wc"] >= 10].reset_index(drop=True)
+        df = df[~df["caption"].str.startswith("A photograph from Visual Genome")
+               ].reset_index(drop=True)
 
+        print(f"[Dataset] After filtering: {len(df)} samples")
         if max_samples:
             df = df.head(max_samples)
 
@@ -108,7 +157,7 @@ class FlickrSketchDataset(Dataset):
 
         img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_LANCZOS4)
 
-        # CHANGE: skip low-contrast/blank images
+        # Skip blank/low-contrast images
         gray_check = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
         if gray_check.std() < 0.05:
             return self.__getitem__((idx + 1) % len(self.df))
@@ -136,7 +185,7 @@ def make_loader(csv_path, image_root, batch_size, num_workers, max_samples=None)
 
 
 ###########################################################################
-# REGION ATTENTION MODULES  (unchanged — working correctly)
+# REGION ATTENTION MODULES
 ###########################################################################
 
 class RegionExtractor(nn.Module):
@@ -189,10 +238,10 @@ class RegionAwareAttnProcessor(nn.Module):
         B, S, D  = hidden_states.shape
         kv       = encoder_hidden_states if is_cross else hidden_states
 
-        Q, K, V  = attn.to_q(hidden_states), attn.to_k(kv), attn.to_v(kv)
-        hd       = D // attn.heads
-        rshp     = lambda t: t.view(B, -1, attn.heads, hd).transpose(1, 2)
-        Q, K, V  = rshp(Q), rshp(K), rshp(V)
+        Q, K, V = attn.to_q(hidden_states), attn.to_k(kv), attn.to_v(kv)
+        hd      = D // attn.heads
+        rshp    = lambda t: t.view(B, -1, attn.heads, hd).transpose(1, 2)
+        Q, K, V = rshp(Q), rshp(K), rshp(V)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(hd)
 
@@ -250,7 +299,7 @@ def load_models(device):
 
     cn   = ControlNetModel.from_pretrained(CN_ID, torch_dtype=DTYPE).to(device)
 
-    # CHANGE: freeze all, only unfreeze mid_block (~5M params)
+    # Selective freeze: down_blocks.3 + mid_block
     for p in cn.parameters():
         p.requires_grad = False
     for name, p in cn.named_parameters():
@@ -278,7 +327,6 @@ def inject_attn(unet, device):
             new_procs[name] = SafeAttnProcessor(proc)
     unet.set_attn_processor(new_procs)
     print(f"  Injected {n} RegionAwareAttnProcessors")
-    return n
 
 
 def region_proc_params(unet):
@@ -294,30 +342,38 @@ def _freeze(m, name):
 
 
 ###########################################################################
-# CHECKPOINT RESUME
+# CHECKPOINT
 ###########################################################################
 
-def load_checkpoint(m, opt, resume_path, device):
-    """CHANGE: Load checkpoint and resume from saved epoch."""
+def save_checkpoint(m, ema_cn, opt, epoch, metrics, path):
+    torch.save({
+        "epoch":       epoch,
+        "controlnet":  m["cn"].state_dict(),
+        "controlnet_ema": ema_cn.state_dict(),
+        "re":          m["re"].state_dict(),
+        "sa":          m["sa"].state_dict(),
+        "optimizer":   opt.state_dict(),
+        "metrics":     metrics,
+    }, str(path))
+
+
+def load_checkpoint(m, ema_cn, opt, resume_path, device):
     if not resume_path or not os.path.exists(resume_path):
-        print(f"[RESUME] No checkpoint found at {resume_path}, starting fresh.")
+        print(f"[RESUME] Starting fresh (no checkpoint at '{resume_path}')")
         return 0
-
-    print(f"[RESUME] Loading checkpoint: {resume_path}")
+    print(f"[RESUME] Loading: {resume_path}")
     ckpt = torch.load(resume_path, map_location=device)
-
     m["cn"].load_state_dict(ckpt["controlnet"])
+    if "controlnet_ema" in ckpt:
+        ema_cn.load_state_dict(ckpt["controlnet_ema"])
     m["re"].load_state_dict(ckpt["re"])
     m["sa"].load_state_dict(ckpt["sa"])
-
     if "optimizer" in ckpt:
         opt.load_state_dict(ckpt["optimizer"])
-
-    start_epoch = ckpt.get("epoch", 0)
-    metrics     = ckpt.get("metrics", {})
-    print(f"[RESUME] Resumed from epoch {start_epoch} | "
-          f"Last MSE: {metrics.get('MSE', 'N/A')}")
-    return start_epoch
+    epoch = ckpt.get("epoch", 0)
+    print(f"[RESUME] Resumed from epoch {epoch} | "
+          f"MSE: {ckpt.get('metrics', {}).get('MSE', 'N/A')}")
+    return epoch
 
 
 ###########################################################################
@@ -343,21 +399,28 @@ def compute_metrics(pred, target):
 
 def print_metrics(metrics_log, final, nan_count, train_time,
                   total_time, throughput, peak_vram, n_params):
-    W = 65
+    W = 70
     print("\n" + "=" * W)
-    print(f"{'TRAINING METRICS':^{W}}")
+    print(f"{'FINAL TRAINING METRICS':^{W}}")
     print("=" * W)
     print(f"\n{'Ep':>3} {'Loss':>10} {'MSE':>9} {'MAE':>9} {'PSNR':>9} {'SSIM':>9}")
     print("-" * W)
     for r in metrics_log:
+        marker = " ✓" if r.get("MSE", 1) < 0.1 else ""
         print(f"  {r['epoch']:>2}  {r['loss']:>10.6f} {r['MSE']:>9.6f} "
-              f"{r['MAE']:>9.6f} {r['PSNR']:>9.3f} {r['SSIM']:>9.6f}")
+              f"{r['MAE']:>9.6f} {r['PSNR']:>9.3f} {r['SSIM']:>9.6f}{marker}")
     print("\n" + "-" * W)
+    targets = [
+        ("Target MSE",     "< 0.1",  f"{final.get('MSE',1):.6f}",  final.get('MSE',1) < 0.1),
+        ("Target MAE",     "< 0.3",  f"{final.get('MAE',1):.6f}",  final.get('MAE',1) < 0.3),
+        ("Target PSNR",    "> 18dB", f"{final.get('PSNR',0):.4f}", final.get('PSNR',0) > 18),
+        ("Target SSIM",    "> 0.6",  f"{final.get('SSIM',0):.6f}", final.get('SSIM',0) > 0.6),
+    ]
+    for name, target, val, met in targets:
+        status = "✅ MET" if met else "❌ NOT MET"
+        print(f"  {name:<20} {target:<10} {val:<15} {status}")
+    print("-" * W)
     for k, v in [
-        ("Final MSE",          f"{final.get('MSE',  0):.6f}"),
-        ("Final MAE",          f"{final.get('MAE',  0):.6f}"),
-        ("Final PSNR (dB)",    f"{final.get('PSNR', 0):.4f}"),
-        ("Final SSIM",         f"{final.get('SSIM', 0):.6f}"),
         ("NaN steps skipped",  str(nan_count)),
         ("Training time (s)",  f"{train_time:.1f}"),
         ("Total runtime (s)",  f"{total_time:.1f}"),
@@ -365,7 +428,7 @@ def print_metrics(metrics_log, final, nan_count, train_time,
         ("Peak VRAM (GB)",     f"{peak_vram:.2f}"),
         ("Trainable params",   f"{n_params:,}"),
     ]:
-        print(f"  {k:<30} {v:>28}")
+        print(f"  {k:<30} {v}")
     print("=" * W)
 
 
@@ -383,18 +446,19 @@ def sample_timesteps(bs, device, total=1000, bias=TIMESTEP_BIAS):
 
 
 ###########################################################################
-# INFERENCE
+# INFERENCE  (uses EMA weights for better quality)
 ###########################################################################
 
-def run_inference(m, sched, device, sample_batch, epoch):
+def run_inference(m, ema_cn, sched, device, sample_batch, epoch):
     INFER_DIR.mkdir(parents=True, exist_ok=True)
-    print("\n[INFERENCE] Generating output image...")
+    print("\n[INFERENCE] Generating output image (using EMA weights)...")
 
     edges    = sample_batch["edge_map"]
     captions = sample_batch["caption"]
 
+    # Use EMA controlnet for inference
     pipe = StableDiffusionControlNetPipeline.from_pretrained(
-        SD_ID, controlnet=m["cn"],
+        SD_ID, controlnet=ema_cn.shadow,
         torch_dtype=DTYPE, safety_checker=None,
     ).to(device)
     pipe.scheduler = sched
@@ -431,10 +495,12 @@ def run_inference(m, sched, device, sample_batch, epoch):
 
 def main():
     print("=" * 60)
-    print("DUAL-STAGE REGION-AWARE DIFFUSION — v2 Training")
+    print("DUAL-STAGE REGION-AWARE DIFFUSION v3")
+    print(f"  Targets: MSE<0.1 | MAE<0.3 | PSNR>18dB | SSIM>0.6")
     print(f"  Images: {NUM_IMAGES} | Epochs: {NUM_EPOCHS} | "
           f"Batch: {BATCH_SIZE} | LR: {LR}")
-    print(f"  GradAccum: {GRAD_ACCUM_STEPS} | TimestepBias: {TIMESTEP_BIAS}")
+    print(f"  GradAccum: {GRAD_ACCUM_STEPS} | EMA: {EMA_DECAY} | "
+          f"SNR_gamma: {SNR_GAMMA}")
     print(f"  Trainable blocks: {TRAIN_CN_BLOCKS}")
     if RESUME_CKPT:
         print(f"  Resuming from: {RESUME_CKPT}")
@@ -471,6 +537,9 @@ def main():
     m["unet"].train(); m["cn"].train()
     m["re"].train();   m["sa"].train()
 
+    # EMA for controlnet
+    ema_cn = EMA(m["cn"], decay=EMA_DECAY)
+
     trainable = (
         [p for p in m["cn"].parameters() if p.requires_grad] +
         [p for p in m["re"].parameters() if p.requires_grad] +
@@ -480,32 +549,31 @@ def main():
     N_params = sum(p.numel() for p in trainable)
     print(f"\n[OPT] Trainable params: {N_params:,}")
 
-    opt = AdamW(trainable, lr=LR, weight_decay=1e-4)
+    opt = AdamW(trainable, lr=LR, weight_decay=1e-4, betas=(0.9, 0.999))
 
-    # CHANGE: LR warmup 200 steps then cosine decay
-    total_steps  = (NUM_EPOCHS * len(all_batches)) // GRAD_ACCUM_STEPS
-    warmup_steps = min(200, total_steps // 10)
-    warmup_sched = LinearLR(opt, start_factor=0.1, end_factor=1.0,
-                             total_iters=warmup_steps)
-    cosine_sched = CosineAnnealingLR(opt, T_max=total_steps - warmup_steps,
-                                      eta_min=LR * 0.05)
-    lr_sched     = SequentialLR(opt, schedulers=[warmup_sched, cosine_sched],
-                                 milestones=[warmup_steps])
-    print(f"[SCHED] Warmup {warmup_steps} steps → cosine over {total_steps} total steps")
+    # Cyclic cosine with restarts every 10 epochs
+    steps_per_epoch = len(all_batches) // GRAD_ACCUM_STEPS
+    lr_sched        = CosineAnnealingWarmRestarts(
+        opt, T_0=max(1, steps_per_epoch * 10), T_mult=1, eta_min=LR * 0.01
+    )
+    print(f"[SCHED] CosineWarmRestarts T_0={steps_per_epoch*10} steps "
+          f"(restarts every 10 epochs)")
 
-    # CHANGE: resume from checkpoint
-    start_epoch = load_checkpoint(m, opt, RESUME_CKPT, device)
+    # Resume
+    start_epoch = load_checkpoint(m, ema_cn, opt, RESUME_CKPT, device)
 
     print(f"\n[TRAIN] Epochs {start_epoch+1}→{NUM_EPOCHS} | {IMAGE_SIZE}px | "
-          f"timestep bias {TIMESTEP_BIAS*100:.0f}%")
+          f"SNR-weighted loss | EMA decay={EMA_DECAY}")
     print("-" * 60)
 
-    t_train      = time.time()
-    nan_count    = 0
-    total_imgs   = 0
-    metrics_log  = []
-    last_metrics = {}
-    global_step  = start_epoch * (len(all_batches) // GRAD_ACCUM_STEPS)
+    t_train        = time.time()
+    nan_count      = 0
+    total_imgs     = 0
+    metrics_log    = []
+    last_metrics   = {}
+    best_mse       = float("inf")
+    no_improve     = 0
+    global_step    = start_epoch * steps_per_epoch
 
     for epoch in range(start_epoch + 1, NUM_EPOCHS + 1):
         ep_loss = ep_mse = ep_mae = ep_psnr = ep_ssim = 0.0
@@ -548,7 +616,10 @@ def main():
                 cross_attention_kwargs={"region_weights": reg_w},
             ).sample
 
-            loss = F.mse_loss(noise_pred, noise) / GRAD_ACCUM_STEPS
+            # SNR-weighted loss instead of plain MSE
+            loss = snr_weighted_loss(
+                noise_pred, noise, ts, sched, gamma=SNR_GAMMA
+            ) / GRAD_ACCUM_STEPS
 
             if torch.isnan(loss) or torch.isinf(loss):
                 nan_count += 1
@@ -564,6 +635,7 @@ def main():
                 opt.step()
                 lr_sched.step()
                 opt.zero_grad()
+                ema_cn.update(m["cn"])  # update EMA after every optimizer step
                 global_step += 1
 
             unscaled = loss.item() * GRAD_ACCUM_STEPS
@@ -581,29 +653,61 @@ def main():
             }
 
         metrics_log.append({"epoch": epoch, **last_metrics})
+
+        targets_met = (
+            last_metrics.get("MSE",  1) < 0.1 and
+            last_metrics.get("PSNR", 0) > 18  and
+            last_metrics.get("SSIM", 0) > 0.6
+        )
+        marker = " 🎯 ALL TARGETS MET" if targets_met else ""
+
         print(f"  Ep {epoch}/{NUM_EPOCHS} | "
               f"Loss {last_metrics.get('loss',0):.4f} | "
               f"MSE {last_metrics.get('MSE',0):.4f} | "
+              f"MAE {last_metrics.get('MAE',0):.4f} | "
               f"PSNR {last_metrics.get('PSNR',0):.2f}dB | "
               f"SSIM {last_metrics.get('SSIM',0):.4f} | "
               f"LR {opt.param_groups[0]['lr']:.2e} | "
-              f"{time.time()-t_train:.0f}s")
+              f"{time.time()-t_train:.0f}s{marker}")
 
-        # Save checkpoint with optimizer state for proper resume
+        # Save checkpoint every epoch
         ckpt_path = CKPT_DIR / f"checkpoint_epoch_{epoch}.pt"
-        torch.save({
-            "epoch":       epoch,
-            "controlnet":  m["cn"].state_dict(),
-            "re":          m["re"].state_dict(),
-            "sa":          m["sa"].state_dict(),
-            "optimizer":   opt.state_dict(),   # CHANGE: save optimizer too
-            "metrics":     last_metrics,
-        }, str(ckpt_path))
-        print(f"  Checkpoint saved → {ckpt_path}")
+        save_checkpoint(m, ema_cn, opt, epoch, last_metrics, ckpt_path)
+        print(f"  Checkpoint → {ckpt_path}")
 
-    # Inference
+        # Save best checkpoint separately
+        cur_mse = last_metrics.get("MSE", 1)
+        if cur_mse < best_mse:
+            best_mse = cur_mse
+            no_improve = 0
+            save_checkpoint(m, ema_cn, opt, epoch, last_metrics,
+                            CKPT_DIR / "checkpoint_best.pt")
+            print(f"  ★ New best MSE: {best_mse:.6f} → checkpoint_best.pt")
+        else:
+            no_improve += 1
+
+        # Early stopping — only after epoch 30 to ensure enough training
+        if epoch >= 30 and no_improve >= EARLY_STOP_PAT:
+            print(f"\n[EARLY STOP] No MSE improvement for {EARLY_STOP_PAT} epochs. "
+                  f"Best MSE: {best_mse:.6f}. Stopping at epoch {epoch}.")
+            break
+
+        # Stop early if all targets met
+        if targets_met and epoch >= 20:
+            print(f"\n[CONVERGED] All targets met at epoch {epoch}! Stopping.")
+            break
+
+   
+    best_path = CKPT_DIR / "checkpoint_best.pt"
+    if best_path.exists():
+        print(f"\n[INFERENCE] Loading best checkpoint for output generation...")
+        ckpt = torch.load(str(best_path), map_location=device)
+        m["cn"].load_state_dict(ckpt["controlnet"])
+        if "controlnet_ema" in ckpt:
+            ema_cn.load_state_dict(ckpt["controlnet_ema"])
+
     m["cn"].eval()
-    run_inference(m, sched, device, all_batches[0], NUM_EPOCHS)
+    run_inference(m, ema_cn, sched, device, all_batches[0], NUM_EPOCHS)
 
     t_end      = time.time()
     train_dur  = t_end - t_train
@@ -613,7 +717,9 @@ def main():
     print_metrics(metrics_log, last_metrics, nan_count,
                   train_dur, t_end - t0, throughput, peak_vram, N_params)
 
-    print(f"\n[DONE] Outputs at {OUTPUT_DIR}")
+    print(f"\n[DONE] All outputs at {OUTPUT_DIR}")
+    print(f"  Best checkpoint: {CKPT_DIR}/checkpoint_best.pt")
+    print(f"  Generated image: {INFER_DIR}/generated_epoch{NUM_EPOCHS}.png")
 
 
 if __name__ == "__main__":
