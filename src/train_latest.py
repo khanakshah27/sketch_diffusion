@@ -288,7 +288,7 @@ def load_models(device):
     for name, p in cn.named_parameters():
         if any(blk in name for blk in TRAIN_CN_BLOCKS):
             p.requires_grad = True
-            p.register_hook(lambda g: g.float() if g is not None else g)
+            p.register_hook(lambda g: g)
 
     cn_total   = sum(p.numel() for p in cn.parameters())
     cn_trained = sum(p.numel() for p in cn.parameters() if p.requires_grad)
