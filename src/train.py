@@ -77,13 +77,17 @@ VAL_DIR    = OUTPUT_DIR / "validation"
 NUM_IMAGES       = int(os.environ.get("NUM_IMAGES",       "10000"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",       "16"))
 NUM_EPOCHS       = int(os.environ.get("NUM_EPOCHS",       "50"))
-LR               = float(os.environ.get("LR",             "3e-5"))
-GRAD_ACCUM_STEPS = int(os.environ.get("GRAD_ACCUM_STEPS", "2"))
+# Lower peak LR — 3e-5 was slightly too aggressive for mid_block only fine-tuning
+LR               = float(os.environ.get("LR",             "2e-5"))
+# Accumulate 4 steps = effective batch 64 — smoother, more stable gradients
+GRAD_ACCUM_STEPS = int(os.environ.get("GRAD_ACCUM_STEPS", "4"))
 NUM_WORKERS      = int(os.environ.get("NUM_WORKERS",      "4"))
-TIMESTEP_BIAS    = float(os.environ.get("TIMESTEP_BIAS",  "0.8"))
+# 85% low-noise steps (was 80%) — more focus on informative timesteps
+TIMESTEP_BIAS    = float(os.environ.get("TIMESTEP_BIAS",  "0.85"))
 RESUME_CKPT      = os.environ.get("RESUME_CKPT",          "auto")  # 'auto' finds latest
 EMA_DECAY        = float(os.environ.get("EMA_DECAY",      "0.9995"))
-SNR_GAMMA        = float(os.environ.get("SNR_GAMMA",      "5.0"))
+# SNR gamma=3 (was 5) — more aggressive down-weighting of noisy timesteps
+SNR_GAMMA        = float(os.environ.get("SNR_GAMMA",      "3.0"))
 VAL_EVERY        = int(os.environ.get("VAL_EVERY",        "3"))
 VAL_IMAGES       = int(os.environ.get("VAL_IMAGES",       "32"))
 VAL_STEPS        = int(os.environ.get("VAL_STEPS",        "20"))
@@ -508,6 +512,10 @@ def compute_image_metrics(generated, ground_truth):
 
 def build_val_pipeline(m, ema_cn, sched, device):
     print("[VAL PIPE] Building validation pipeline (once)...")
+    # FIX: cast EMA shadow to bfloat16 for inference
+    # Training casts mid_block weights to float32 — EMA inherits this
+    # GroupNorm in ControlNet expects bfloat16 to match the rest of the network
+    ema_cn.shadow.to(dtype=COMPUTE_DTYPE)
     pipe = StableDiffusionControlNetPipeline.from_pretrained(
         SD_ID,
         controlnet=ema_cn.shadow,
@@ -529,6 +537,8 @@ def build_val_pipeline(m, ema_cn, sched, device):
 
 
 def update_val_pipeline(val_pipe, ema_cn):
+    # FIX: always cast to bfloat16 before assigning to pipeline
+    ema_cn.shadow.to(dtype=COMPUTE_DTYPE)
     val_pipe.controlnet = ema_cn.shadow
 
 
@@ -744,12 +754,12 @@ def main():
     lr_sched    = OneCycleLR(
         opt, max_lr=LR,
         total_steps=total_steps,
-        pct_start=0.1,        # 10% warmup
+        pct_start=0.15,       # 15% warmup (was 10%) — more stable ramp-up
         anneal_strategy='cos',
-        div_factor=10,        # start at LR/10
-        final_div_factor=100, # end at LR/100
+        div_factor=25,        # start at LR/25 (was LR/10) — gentler start
+        final_div_factor=1000,# end at LR/1000 — tighter final convergence
     )
-    print(f"[SCHED] OneCycleLR: warmup 10% → peak {LR} → final {LR/100:.2e} "
+    print(f"[SCHED] OneCycleLR: warmup 15% → peak {LR} → final {LR/1000:.2e} "
           f"over {total_steps} steps")
 
     # Resume
