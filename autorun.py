@@ -5,14 +5,14 @@ autorun.py -- Full automation script for Vast.ai
 Runs everything automatically:
   1. Installs gcloud if missing
   2. Authenticates with GCS bucket
-  3. Downloads dataset from bucket
+  3. Downloads dataset from bucket (handles tar.gz)
   4. Installs Python dependencies
   5. Runs convert.py to generate captions.csv
   6. Starts training in background
   7. Tails the log live
 
 Usage:
-  python autorun.py
+  python /autorun.py
 
 Optional env vars to override defaults:
   BUCKET_NAME   — GCS bucket name (default: diffm_bucket1)
@@ -20,9 +20,6 @@ Optional env vars to override defaults:
   NUM_EPOCHS    — number of training epochs (default: 50)
   RESUME        — set to 'yes' to auto-resume from latest checkpoint
   SKIP_DOWNLOAD — set to 'yes' if dataset already on disk
-
-Just run: python autorun.py
-And it handles everything else.
 """
 
 import os
@@ -32,7 +29,7 @@ import shutil
 import time
 from pathlib import Path
 
-# ── Config — change these if needed ───────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────
 BUCKET_NAME   = os.environ.get("BUCKET_NAME",   "diffm_bucket1")
 PROJECT_ID    = os.environ.get("PROJECT_ID",    "diffusionmodel-492408")
 WORKSPACE     = Path("/workspace")
@@ -43,19 +40,19 @@ OUTPUT_DIR    = WORKSPACE / "outputs"
 LOG_FILE      = OUTPUT_DIR / "training_v6.log"
 TRAIN_PID     = OUTPUT_DIR / "train.pid"
 
-NUM_EPOCHS    = os.environ.get("NUM_EPOCHS",  "50")
-BATCH_SIZE    = os.environ.get("BATCH_SIZE",  "16")
-LR            = os.environ.get("LR",          "3e-5")
-RESUME        = os.environ.get("RESUME",      "yes")   # auto-resume by default
+NUM_EPOCHS    = os.environ.get("NUM_EPOCHS",    "50")
+BATCH_SIZE    = os.environ.get("BATCH_SIZE",    "16")
+LR            = os.environ.get("LR",            "3e-5")
+RESUME        = os.environ.get("RESUME",        "yes")
 SKIP_DOWNLOAD = os.environ.get("SKIP_DOWNLOAD", "no")
 
 GCLOUD_PATH   = Path("/root/google-cloud-sdk/bin/gcloud")
 GCLOUD_INIT   = Path("/root/google-cloud-sdk/path.bash.inc")
 
+
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def run(cmd, check=True, shell=True, capture=False):
-    """Run a shell command, print it, handle errors."""
     print(f"\n>>> {cmd}")
     if capture:
         result = subprocess.run(cmd, shell=shell, capture_output=True, text=True)
@@ -68,7 +65,6 @@ def run(cmd, check=True, shell=True, capture=False):
 
 
 def gcloud(cmd, check=True, capture=False):
-    """Run a gcloud command using the correct path."""
     if GCLOUD_PATH.exists():
         return run(f"{GCLOUD_PATH} {cmd}", check=check, capture=capture)
     else:
@@ -83,7 +79,7 @@ def section(title):
 
 def check_disk():
     stat = shutil.disk_usage("/workspace")
-    free_gb = stat.free / (1024**3)
+    free_gb  = stat.free  / (1024**3)
     total_gb = stat.total / (1024**3)
     print(f"[DISK] Free: {free_gb:.1f}GB / Total: {total_gb:.1f}GB")
     if free_gb < 15:
@@ -92,14 +88,13 @@ def check_disk():
     return free_gb
 
 
-# ── Step 1: Install gcloud if not present ─────────────────────────────────
+# ── Step 1: Install gcloud ─────────────────────────────────────────────────
 
 def install_gcloud():
     section("STEP 1: Checking gcloud")
 
     if GCLOUD_PATH.exists():
         print(f"[OK] gcloud found at {GCLOUD_PATH}")
-        # Source the path
         run(f"source {GCLOUD_INIT} 2>/dev/null || true", check=False)
         return
 
@@ -116,9 +111,10 @@ def install_gcloud():
 def authenticate_gcp():
     section("STEP 2: GCP Authentication")
 
-    # Check if already authenticated
-    result = run(f"{GCLOUD_PATH} auth list --format='value(account)'",
-                 check=False, capture=True)
+    result = run(
+        f"{GCLOUD_PATH} auth list --format='value(account)'",
+        check=False, capture=True
+    )
     if result and "@" in result:
         print(f"[OK] Already authenticated as: {result}")
         run(f"{GCLOUD_PATH} config set project {PROJECT_ID}", check=False)
@@ -127,7 +123,7 @@ def authenticate_gcp():
 
     print("[INFO] Not authenticated. Starting auth flow...")
     print("\n" + "="*50)
-    print("  ACTION NEEDED: Follow the prompts below")
+    print("  ACTION NEEDED:")
     print("  1. Click the URL that appears")
     print("  2. Sign in with your Google account")
     print("  3. Copy the verification code")
@@ -150,7 +146,7 @@ def download_dataset():
         print("[SKIP] SKIP_DOWNLOAD=yes — skipping dataset download")
         return
 
-    # Check if already downloaded
+    # Check if images already downloaded and extracted
     if IMAGE_DIR.exists():
         n_images = len(list(IMAGE_DIR.glob("*.jpg")))
         if n_images > 100:
@@ -158,56 +154,90 @@ def download_dataset():
             if TOKEN_FILE.exists():
                 print(f"[OK] Token file already present: {TOKEN_FILE}")
                 return
-        else:
-            print(f"[WARN] Only {n_images} images found — re-downloading")
 
-    # List bucket contents first
-    print(f"[INFO] Checking bucket gs://{BUCKET_NAME}/...")
-    bucket_contents = run(
+    # ── Download token file ────────────────────────────────────────────────
+    if not TOKEN_FILE.exists():
+        print("[INFO] Downloading caption token file...")
+        success = run(
+            f"{GCLOUD_PATH} storage cp "
+            f"gs://{BUCKET_NAME}/results_20130124.token {WORKSPACE}/",
+            check=False
+        )
+        if not success:
+            print("[WARN] Token file not found in bucket — will try captions.csv directly later")
+
+    # ── Download images ────────────────────────────────────────────────────
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    print("[INFO] Checking bucket for images...")
+
+    # Show bucket contents for debugging
+    bucket_ls = run(
         f"{GCLOUD_PATH} storage ls gs://{BUCKET_NAME}/",
         check=False, capture=True
     )
-    print(f"[INFO] Bucket contents:\n{bucket_contents}")
+    print(f"[INFO] Bucket contents:\n{bucket_ls}")
 
-    # Download token file
-    if not TOKEN_FILE.exists():
-        print(f"[INFO] Downloading token file...")
-        success = run(
-            f"{GCLOUD_PATH} storage cp gs://{BUCKET_NAME}/results_20130124.token {WORKSPACE}/",
-            check=False
-        )
-        if not success or not TOKEN_FILE.exists():
-            print("[WARN] Token file not in bucket. Checking for captions.csv directly...")
-            run(
-                f"{GCLOUD_PATH} storage cp gs://{BUCKET_NAME}/captions.csv {WORKSPACE}/",
-                check=False
-            )
+    # FIX: Check for tar.gz first (this is what's in your bucket)
+    tar_path  = f"gs://{BUCKET_NAME}/flickr30k-images.tar.gz"
+    tar_check = run(
+        f"{GCLOUD_PATH} storage ls {tar_path} 2>/dev/null",
+        check=False, capture=True
+    )
 
-    # Download images — check bucket path
-    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"[INFO] Downloading Flickr30k images (this takes 20-40 min)...")
+    if tar_check and "flickr30k-images.tar.gz" in tar_check:
+        # ── tar.gz path ───────────────────────────────────────────────────
+        local_tar = WORKSPACE / "flickr30k-images.tar.gz"
 
-    # Try different possible bucket structures
-    for bucket_path in [
-        f"gs://{BUCKET_NAME}/flickr30k-images",
-        f"gs://{BUCKET_NAME}/flickr30k-images/",
-        f"gs://{BUCKET_NAME}/"
-    ]:
-        result = run(
-            f"{GCLOUD_PATH} storage ls {bucket_path} 2>/dev/null | head -5",
-            check=False, capture=True
-        )
-        if result and ".jpg" in result:
-            print(f"[INFO] Images found at: {bucket_path}")
-            run(f"{GCLOUD_PATH} storage cp -r {bucket_path} {WORKSPACE}/")
-            break
+        if local_tar.exists():
+            print(f"[INFO] tar.gz already downloaded locally. Extracting...")
+        else:
+            print(f"[INFO] Downloading flickr30k-images.tar.gz from bucket...")
+            run(f"{GCLOUD_PATH} storage cp {tar_path} {local_tar}")
+
+        print(f"[INFO] Extracting archive to {WORKSPACE}/ (5-10 min)...")
+        run(f"tar -xzf {local_tar} -C {WORKSPACE}/")
+
+        # Free disk space after extraction
+        print(f"[INFO] Removing tar.gz to free disk space...")
+        local_tar.unlink()
+        print(f"[OK] tar.gz extracted and removed.")
+
     else:
-        print("[ERROR] Could not find images in bucket.")
-        print("        Please upload them manually or check BUCKET_NAME.")
-        sys.exit(1)
+        # ── Fallback: direct folder copy ──────────────────────────────────
+        print("[INFO] No tar.gz found. Trying direct folder download...")
+        found = False
+        for bucket_path in [
+            f"gs://{BUCKET_NAME}/flickr30k-images",
+            f"gs://{BUCKET_NAME}/flickr30k-images/",
+        ]:
+            result = run(
+                f"{GCLOUD_PATH} storage ls {bucket_path} 2>/dev/null | head -5",
+                check=False, capture=True
+            )
+            if result and ".jpg" in result:
+                print(f"[INFO] Images found at: {bucket_path}")
+                run(f"{GCLOUD_PATH} storage cp -r {bucket_path} {WORKSPACE}/")
+                found = True
+                break
+
+        if not found:
+            print("[ERROR] Could not find images in bucket.")
+            print("        Expected either:")
+            print(f"          gs://{BUCKET_NAME}/flickr30k-images.tar.gz")
+            print(f"          gs://{BUCKET_NAME}/flickr30k-images/*.jpg")
+            print("        Full bucket listing:")
+            run(f"{GCLOUD_PATH} storage ls gs://{BUCKET_NAME}/", check=False)
+            sys.exit(1)
 
     n_images = len(list(IMAGE_DIR.glob("*.jpg")))
-    print(f"[OK] Downloaded {n_images} images to {IMAGE_DIR}")
+    print(f"[OK] {n_images} images ready at {IMAGE_DIR}")
+    if n_images < 100:
+        print("[WARN] Very few images found — extraction may have put them in a subfolder.")
+        print(f"       Check: ls {WORKSPACE}/")
+        # Try to find where they actually extracted to
+        result = run(f"find {WORKSPACE} -name '*.jpg' | head -3", check=False, capture=True)
+        if result:
+            print(f"[INFO] Found jpg files at: {result}")
 
 
 # ── Step 4: Install Python dependencies ───────────────────────────────────
@@ -215,26 +245,28 @@ def download_dataset():
 def install_dependencies():
     section("STEP 4: Installing Python Dependencies")
 
-    # Check if already installed
-    result = run("python -c 'import diffusers; print(diffusers.__version__)'",
-                 check=False, capture=True)
+    result = run(
+        "python -c 'import diffusers; print(diffusers.__version__)'",
+        check=False, capture=True
+    )
     if result and result.strip():
         print(f"[OK] diffusers already installed: {result}")
-        # Still install skimage if missing
+        # Ensure skimage is present
         run("pip install scikit-image --quiet", check=False)
         return
 
     print("[INFO] Installing dependencies...")
-    run("pip install torch>=2.0.0 torchvision>=0.15.0 --quiet")
-    run("pip install diffusers==0.27.2 transformers==4.40.0 --quiet")
+    run("pip install 'torch>=2.0.0' 'torchvision>=0.15.0' --quiet")
+    run("pip install 'diffusers==0.27.2' 'transformers==4.40.0' --quiet")
     run("pip install accelerate einops pandas Pillow --quiet")
     run("pip install opencv-python-headless scikit-image --quiet")
-    run("pip install xformers --quiet", check=False)  # optional
+    run("pip install xformers --quiet", check=False)
 
-    # Verify
     run("python -c \"import torch; print('PyTorch:', torch.__version__)\"")
-    run("python -c \"import torch; print('CUDA:', torch.cuda.is_available(), "
-        "torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')\"")
+    run(
+        "python -c \"import torch; print('CUDA:', torch.cuda.is_available(), "
+        "torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')\""
+    )
     print("[OK] Dependencies installed.")
 
 
@@ -249,10 +281,10 @@ def run_convert():
         return
 
     if not TOKEN_FILE.exists():
-        print(f"[SKIP] No token file found at {TOKEN_FILE}")
-        print("       If captions.csv is already in the bucket, downloading it...")
+        print(f"[INFO] No token file. Trying to download captions.csv from bucket...")
         run(
-            f"{GCLOUD_PATH} storage cp gs://{BUCKET_NAME}/captions.csv {WORKSPACE}/",
+            f"{GCLOUD_PATH} storage cp "
+            f"gs://{BUCKET_NAME}/captions.csv {WORKSPACE}/",
             check=False
         )
         if CAPTIONS_CSV.exists():
@@ -261,26 +293,24 @@ def run_convert():
         print("[ERROR] Neither token file nor captions.csv found.")
         sys.exit(1)
 
-    print("[INFO] Running convert.py...")
+    # Find convert.py
+    convert_path = None
+    for p in ["/convert.py", "convert.py", "src/convert.py"]:
+        if os.path.exists(p):
+            convert_path = p
+            break
+    if convert_path is None:
+        print("[ERROR] convert.py not found at /convert.py")
+        sys.exit(1)
+
+    print(f"[INFO] Running {convert_path}...")
     env = {
         **os.environ,
         "CAPTION_FILE": str(TOKEN_FILE),
         "IMAGE_FOLDER":  str(IMAGE_DIR),
         "OUTPUT_CSV":    str(CAPTIONS_CSV),
     }
-
-    # Find convert.py
-    for path in ["/train.py", "/convert.py", "convert.py"]:
-        if os.path.exists(path.replace("train", "convert")):
-            convert_path = path.replace("train", "convert")
-            break
-    else:
-        convert_path = "/convert.py"
-
-    result = subprocess.run(
-        ["python", convert_path],
-        env=env
-    )
+    result = subprocess.run(["python", convert_path], env=env)
     if result.returncode != 0 or not CAPTIONS_CSV.exists():
         print("[ERROR] convert.py failed.")
         sys.exit(1)
@@ -308,72 +338,67 @@ def start_training():
             train_path = p
             break
     if train_path is None:
-        print("[ERROR] train.py not found. Upload it to /train.py on the instance.")
+        print("[ERROR] train.py not found. Upload it to /train.py")
         sys.exit(1)
     print(f"[OK] Found train.py at: {train_path}")
 
-    # Build environment
     env_vars = {
-        "CSV_PATH":        str(CAPTIONS_CSV),
-        "IMAGE_ROOT":      str(IMAGE_DIR),
-        "OUTPUT_DIR":      str(OUTPUT_DIR),
-        "NUM_IMAGES":      "10000",
-        "BATCH_SIZE":      BATCH_SIZE,
-        "NUM_EPOCHS":      NUM_EPOCHS,
-        "LR":              LR,
-        "GRAD_ACCUM_STEPS":"2",
-        "NUM_WORKERS":     "4",
-        "TIMESTEP_BIAS":   "0.8",
-        "EMA_DECAY":       "0.9995",
-        "SNR_GAMMA":       "5.0",
-        "VAL_EVERY":       "3",
-        "VAL_IMAGES":      "32",
-        "VAL_STEPS":       "20",
-        "EARLY_STOP_PAT":  "5",
-        "RESUME_CKPT":     "auto" if RESUME.lower() == "yes" else "",
+        "CSV_PATH":         str(CAPTIONS_CSV),
+        "IMAGE_ROOT":       str(IMAGE_DIR),
+        "OUTPUT_DIR":       str(OUTPUT_DIR),
+        "NUM_IMAGES":       "10000",
+        "BATCH_SIZE":       BATCH_SIZE,
+        "NUM_EPOCHS":       NUM_EPOCHS,
+        "LR":               LR,
+        "GRAD_ACCUM_STEPS": "2",
+        "NUM_WORKERS":      "4",
+        "TIMESTEP_BIAS":    "0.8",
+        "EMA_DECAY":        "0.9995",
+        "SNR_GAMMA":        "5.0",
+        "VAL_EVERY":        "3",
+        "VAL_IMAGES":       "32",
+        "VAL_STEPS":        "20",
+        "EARLY_STOP_PAT":   "5",
+        "RESUME_CKPT":      "auto" if RESUME.lower() == "yes" else "",
     }
-
-    env_export = " ".join(f"{k}={v}" for k, v in env_vars.items())
 
     print("\n[CONFIG] Training configuration:")
     for k, v in env_vars.items():
         print(f"  {k:<22} = {v}")
 
-    # Kill any existing training process
+    # Kill any existing training
     run("pkill -f 'python.*train.py' 2>/dev/null || true", check=False)
     time.sleep(2)
 
-    # Build nohup command
+    env_export = " ".join(f'{k}="{v}"' for k, v in env_vars.items())
     cmd = (
         f"env {env_export} "
         f"nohup python {train_path} "
         f"> {LOG_FILE} 2>&1 & "
         f"echo $! > {TRAIN_PID} && "
-        f"echo 'Training started with PID:' $(cat {TRAIN_PID})"
+        f"echo 'Training PID:' $(cat {TRAIN_PID})"
     )
 
     print(f"\n[INFO] Launching training in background...")
     run(cmd)
-
     time.sleep(3)
 
-    # Verify it started
     if TRAIN_PID.exists():
         pid = open(TRAIN_PID).read().strip()
-        check = run(f"ps -p {pid} > /dev/null 2>&1", check=False)
-        if check:
-            print(f"[OK] Training process running (PID: {pid})")
+        alive = run(f"ps -p {pid} > /dev/null 2>&1", check=False)
+        if alive:
+            print(f"[OK] Training running (PID: {pid})")
         else:
-            print(f"[WARN] Process {pid} not found. Checking log...")
+            print(f"[WARN] Process {pid} not found. Check log for errors.")
 
-    print(f"\n[INFO] Log file: {LOG_FILE}")
+    print(f"\n[INFO] Log: {LOG_FILE}")
 
 
 # ── Step 7: Tail log ──────────────────────────────────────────────────────
 
 def tail_log():
     section("STEP 7: Live Training Log")
-    print(f"[INFO] Tailing {LOG_FILE}")
+    print(f"[INFO] Watching {LOG_FILE}")
     print("[INFO] Press Ctrl+C to stop watching (training continues in background)")
     print("-" * 60)
 
@@ -386,29 +411,29 @@ def tail_log():
     print()
 
     if not LOG_FILE.exists():
-        print("[ERROR] Log file not created. Training may have failed.")
-        print(f"        Check: cat {OUTPUT_DIR}/training_v6.log")
+        print(f"[ERROR] Log not created. Check: cat {LOG_FILE}")
         return
 
     try:
         run(f"tail -f {LOG_FILE}")
     except KeyboardInterrupt:
-        print(f"\n\n[INFO] Stopped watching log. Training continues in background.")
-        print(f"[INFO] To watch again: tail -f {LOG_FILE}")
-        print(f"[INFO] To check status: ps aux | grep train.py")
-        print(f"[INFO] To download results when done:")
-        print(f"         scp -P PORT root@ssh.vast.ai:{OUTPUT_DIR}/inference/generated_epoch*.png .")
-        print(f"         scp -P PORT root@ssh.vast.ai:{OUTPUT_DIR}/training_v6.log .")
+        print(f"\n\n[INFO] Stopped watching. Training continues in background.")
+        print(f"[INFO] Watch again:    tail -f {LOG_FILE}")
+        print(f"[INFO] Check running:  ps aux | grep train.py")
+        print(f"\n[INFO] When done, download results:")
+        print(f"  scp -P PORT root@ssh.vast.ai:{OUTPUT_DIR}/inference/generated_epoch*.png .")
+        print(f"  scp -P PORT root@ssh.vast.ai:{OUTPUT_DIR}/training_v6.log .")
+        print(f"  scp -P PORT root@ssh.vast.ai:{CKPT_DIR}/checkpoint_best.pt .")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
-    print("  SKETCH DIFFUSION — Full Automation Script")
-    print(f"  Bucket: gs://{BUCKET_NAME}")
+    print("  SKETCH DIFFUSION v6 — Full Automation Script")
+    print(f"  Bucket:  gs://{BUCKET_NAME}")
     print(f"  Project: {PROJECT_ID}")
-    print(f"  Epochs: {NUM_EPOCHS} | LR: {LR} | Resume: {RESUME}")
+    print(f"  Epochs:  {NUM_EPOCHS} | LR: {LR} | Resume: {RESUME}")
     print("=" * 60)
 
     install_gcloud()
