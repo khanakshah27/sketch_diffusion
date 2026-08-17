@@ -376,7 +376,9 @@ def load_models(device):
     for name, p in cn.named_parameters():
         if any(blk in name for blk in TRAIN_CN_BLOCKS):
             p.requires_grad = True
-            p.register_hook(lambda g: g.float() if g is not None else g)
+            # Cast param data to float32 so gradients stay float32
+            # No hook needed — param dtype determines gradient dtype
+            p.data = p.data.float()
 
     cn_total   = sum(p.numel() for p in cn.parameters())
     cn_trained = sum(p.numel() for p in cn.parameters() if p.requires_grad)
