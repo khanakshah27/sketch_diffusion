@@ -6,7 +6,7 @@ Runs everything automatically:
   1. Installs gcloud if missing
   2. Authenticates with GCS bucket
   3. Downloads dataset from bucket (handles tar.gz)
-  4. Installs Python dependencies
+  4. Installs Python dependencies (with huggingface_hub version fix)
   5. Runs convert.py to generate captions.csv
   6. Starts training in background
   7. Tails the log live
@@ -14,12 +14,12 @@ Runs everything automatically:
 Usage:
   python /autorun.py
 
-Optional env vars to override defaults:
+Optional env vars:
   BUCKET_NAME   — GCS bucket name (default: diffm_bucket1)
   PROJECT_ID    — GCP project ID (default: diffusionmodel-492408)
-  NUM_EPOCHS    — number of training epochs (default: 50)
-  RESUME        — set to 'yes' to auto-resume from latest checkpoint
-  SKIP_DOWNLOAD — set to 'yes' if dataset already on disk
+  NUM_EPOCHS    — training epochs (default: 50)
+  RESUME        — 'yes' to auto-resume from latest checkpoint (default: yes)
+  SKIP_DOWNLOAD — 'yes' if dataset already on disk (default: no)
 """
 
 import os
@@ -64,13 +64,6 @@ def run(cmd, check=True, shell=True, capture=False):
     return result.returncode == 0
 
 
-def gcloud(cmd, check=True, capture=False):
-    if GCLOUD_PATH.exists():
-        return run(f"{GCLOUD_PATH} {cmd}", check=check, capture=capture)
-    else:
-        return run(f"gcloud {cmd}", check=check, capture=capture)
-
-
 def section(title):
     print(f"\n{'='*60}")
     print(f"  {title}")
@@ -83,7 +76,7 @@ def check_disk():
     total_gb = stat.total / (1024**3)
     print(f"[DISK] Free: {free_gb:.1f}GB / Total: {total_gb:.1f}GB")
     if free_gb < 15:
-        print("[WARN] Less than 15GB free. Consider clearing space.")
+        print("[WARN] Less than 15GB free.")
         print("       Run: rm -rf /workspace/outputs/checkpoints/checkpoint_epoch_*.pt")
     return free_gb
 
@@ -92,12 +85,10 @@ def check_disk():
 
 def install_gcloud():
     section("STEP 1: Checking gcloud")
-
     if GCLOUD_PATH.exists():
         print(f"[OK] gcloud found at {GCLOUD_PATH}")
         run(f"source {GCLOUD_INIT} 2>/dev/null || true", check=False)
         return
-
     print("[INFO] gcloud not found. Installing...")
     run("curl https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/root")
     if not GCLOUD_PATH.exists():
@@ -110,7 +101,6 @@ def install_gcloud():
 
 def authenticate_gcp():
     section("STEP 2: GCP Authentication")
-
     result = run(
         f"{GCLOUD_PATH} auth list --format='value(account)'",
         check=False, capture=True
@@ -129,7 +119,6 @@ def authenticate_gcp():
     print("  3. Copy the verification code")
     print("  4. Paste it here and press Enter")
     print("="*50 + "\n")
-
     run(f"{GCLOUD_PATH} auth login --no-launch-browser")
     run(f"{GCLOUD_PATH} auth application-default login --no-launch-browser")
     run(f"{GCLOUD_PATH} config set project {PROJECT_ID}")
@@ -146,38 +135,31 @@ def download_dataset():
         print("[SKIP] SKIP_DOWNLOAD=yes — skipping dataset download")
         return
 
-    # Check if images already downloaded and extracted
+    # Check if images already extracted
     if IMAGE_DIR.exists():
         n_images = len(list(IMAGE_DIR.glob("*.jpg")))
         if n_images > 100:
-            print(f"[OK] Images already present: {n_images} jpg files found")
+            print(f"[OK] Images already present: {n_images} jpg files")
             if TOKEN_FILE.exists():
-                print(f"[OK] Token file already present: {TOKEN_FILE}")
+                print(f"[OK] Token file already present")
                 return
 
-    # ── Download token file ────────────────────────────────────────────────
+    # Download token file
     if not TOKEN_FILE.exists():
         print("[INFO] Downloading caption token file...")
-        success = run(
+        run(
             f"{GCLOUD_PATH} storage cp "
             f"gs://{BUCKET_NAME}/results_20130124.token {WORKSPACE}/",
             check=False
         )
-        if not success:
-            print("[WARN] Token file not found in bucket — will try captions.csv directly later")
 
-    # ── Download images ────────────────────────────────────────────────────
+    # Show bucket contents
+    print(f"[INFO] Bucket contents:")
+    run(f"{GCLOUD_PATH} storage ls gs://{BUCKET_NAME}/", check=False)
+
     IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-    print("[INFO] Checking bucket for images...")
 
-    # Show bucket contents for debugging
-    bucket_ls = run(
-        f"{GCLOUD_PATH} storage ls gs://{BUCKET_NAME}/",
-        check=False, capture=True
-    )
-    print(f"[INFO] Bucket contents:\n{bucket_ls}")
-
-    # FIX: Check for tar.gz first (this is what's in your bucket)
+    # Check for tar.gz (your bucket has flickr30k-images.tar.gz)
     tar_path  = f"gs://{BUCKET_NAME}/flickr30k-images.tar.gz"
     tar_check = run(
         f"{GCLOUD_PATH} storage ls {tar_path} 2>/dev/null",
@@ -185,25 +167,23 @@ def download_dataset():
     )
 
     if tar_check and "flickr30k-images.tar.gz" in tar_check:
-        # ── tar.gz path ───────────────────────────────────────────────────
         local_tar = WORKSPACE / "flickr30k-images.tar.gz"
 
         if local_tar.exists():
-            print(f"[INFO] tar.gz already downloaded locally. Extracting...")
+            print(f"[INFO] tar.gz already on disk. Extracting...")
         else:
-            print(f"[INFO] Downloading flickr30k-images.tar.gz from bucket...")
+            print(f"[INFO] Downloading flickr30k-images.tar.gz...")
             run(f"{GCLOUD_PATH} storage cp {tar_path} {local_tar}")
 
-        print(f"[INFO] Extracting archive to {WORKSPACE}/ (5-10 min)...")
+        print(f"[INFO] Extracting to {WORKSPACE}/ (5-10 min)...")
         run(f"tar -xzf {local_tar} -C {WORKSPACE}/")
 
-        # Free disk space after extraction
         print(f"[INFO] Removing tar.gz to free disk space...")
         local_tar.unlink()
-        print(f"[OK] tar.gz extracted and removed.")
+        print(f"[OK] Extraction complete.")
 
     else:
-        # ── Fallback: direct folder copy ──────────────────────────────────
+        # Fallback: direct folder copy
         print("[INFO] No tar.gz found. Trying direct folder download...")
         found = False
         for bucket_path in [
@@ -222,22 +202,24 @@ def download_dataset():
 
         if not found:
             print("[ERROR] Could not find images in bucket.")
-            print("        Expected either:")
-            print(f"          gs://{BUCKET_NAME}/flickr30k-images.tar.gz")
-            print(f"          gs://{BUCKET_NAME}/flickr30k-images/*.jpg")
-            print("        Full bucket listing:")
-            run(f"{GCLOUD_PATH} storage ls gs://{BUCKET_NAME}/", check=False)
+            print(f"        Expected: gs://{BUCKET_NAME}/flickr30k-images.tar.gz")
+            print(f"             or: gs://{BUCKET_NAME}/flickr30k-images/*.jpg")
             sys.exit(1)
 
     n_images = len(list(IMAGE_DIR.glob("*.jpg")))
     print(f"[OK] {n_images} images ready at {IMAGE_DIR}")
+
     if n_images < 100:
-        print("[WARN] Very few images found — extraction may have put them in a subfolder.")
-        print(f"       Check: ls {WORKSPACE}/")
-        # Try to find where they actually extracted to
-        result = run(f"find {WORKSPACE} -name '*.jpg' | head -3", check=False, capture=True)
+        print("[WARN] Very few images — checking extraction path...")
+        result = run(
+            f"find {WORKSPACE} -name '*.jpg' | head -5",
+            check=False, capture=True
+        )
         if result:
-            print(f"[INFO] Found jpg files at: {result}")
+            print(f"[INFO] jpg files found at: {result}")
+            print(f"[INFO] You may need to move them: "
+                  f"mv /workspace/flickr30k-images/flickr30k-images/* "
+                  f"/workspace/flickr30k-images/")
 
 
 # ── Step 4: Install Python dependencies ───────────────────────────────────
@@ -245,29 +227,37 @@ def download_dataset():
 def install_dependencies():
     section("STEP 4: Installing Python Dependencies")
 
+    # Always pin huggingface_hub to fix the cached_download import error
+    # diffusers==0.27.2 requires huggingface_hub==0.23.2 specifically
+    print("[INFO] Pinning huggingface_hub==0.23.2 (fixes diffusers ImportError)...")
+    run("pip install 'huggingface_hub==0.23.2' --quiet --force-reinstall")
+
+    # Check if diffusers already works
     result = run(
         "python -c 'import diffusers; print(diffusers.__version__)'",
         check=False, capture=True
     )
     if result and result.strip():
-        print(f"[OK] diffusers already installed: {result}")
-        # Ensure skimage is present
+        print(f"[OK] diffusers working: {result}")
         run("pip install scikit-image --quiet", check=False)
         return
 
-    print("[INFO] Installing dependencies...")
+    print("[INFO] Installing all dependencies...")
     run("pip install 'torch>=2.0.0' 'torchvision>=0.15.0' --quiet")
-    run("pip install 'diffusers==0.27.2' 'transformers==4.40.0' --quiet")
+    run("pip install 'diffusers==0.27.2' 'transformers==4.40.0' "
+        "'huggingface_hub==0.23.2' --quiet")
     run("pip install accelerate einops pandas Pillow --quiet")
     run("pip install opencv-python-headless scikit-image --quiet")
     run("pip install xformers --quiet", check=False)
 
+    # Verify
     run("python -c \"import torch; print('PyTorch:', torch.__version__)\"")
     run(
         "python -c \"import torch; print('CUDA:', torch.cuda.is_available(), "
         "torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')\""
     )
-    print("[OK] Dependencies installed.")
+    run("python -c \"import diffusers; print('diffusers:', diffusers.__version__)\"")
+    print("[OK] All dependencies installed and verified.")
 
 
 # ── Step 5: Run convert.py ────────────────────────────────────────────────
@@ -281,7 +271,7 @@ def run_convert():
         return
 
     if not TOKEN_FILE.exists():
-        print(f"[INFO] No token file. Trying to download captions.csv from bucket...")
+        print(f"[INFO] No token file. Downloading captions.csv from bucket...")
         run(
             f"{GCLOUD_PATH} storage cp "
             f"gs://{BUCKET_NAME}/captions.csv {WORKSPACE}/",
@@ -342,6 +332,17 @@ def start_training():
         sys.exit(1)
     print(f"[OK] Found train.py at: {train_path}")
 
+    # Verify train.py imports work before launching
+    print("[INFO] Verifying train.py imports...")
+    check = run(
+        f"python -c 'import diffusers, transformers, torch, cv2, sklearn; "
+        f"print(\"imports OK\")'",
+        check=False, capture=True
+    )
+    if "imports OK" not in (check or ""):
+        print("[WARN] Some imports failed. Attempting fix...")
+        run("pip install 'huggingface_hub==0.23.2' scikit-image --quiet --force-reinstall")
+
     env_vars = {
         "CSV_PATH":         str(CAPTIONS_CSV),
         "IMAGE_ROOT":       str(IMAGE_DIR),
@@ -366,7 +367,7 @@ def start_training():
     for k, v in env_vars.items():
         print(f"  {k:<22} = {v}")
 
-    # Kill any existing training
+    # Kill any existing training process
     run("pkill -f 'python.*train.py' 2>/dev/null || true", check=False)
     time.sleep(2)
 
@@ -381,7 +382,7 @@ def start_training():
 
     print(f"\n[INFO] Launching training in background...")
     run(cmd)
-    time.sleep(3)
+    time.sleep(4)
 
     if TRAIN_PID.exists():
         pid = open(TRAIN_PID).read().strip()
@@ -389,7 +390,8 @@ def start_training():
         if alive:
             print(f"[OK] Training running (PID: {pid})")
         else:
-            print(f"[WARN] Process {pid} not found. Check log for errors.")
+            print(f"[WARN] Process {pid} not running. Checking log for errors...")
+            run(f"tail -20 {LOG_FILE}", check=False)
 
     print(f"\n[INFO] Log: {LOG_FILE}")
 
@@ -402,7 +404,6 @@ def tail_log():
     print("[INFO] Press Ctrl+C to stop watching (training continues in background)")
     print("-" * 60)
 
-    # Wait for log to appear
     for _ in range(30):
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > 0:
             break
@@ -411,19 +412,19 @@ def tail_log():
     print()
 
     if not LOG_FILE.exists():
-        print(f"[ERROR] Log not created. Check: cat {LOG_FILE}")
+        print(f"[ERROR] Log not created. Something went wrong.")
         return
 
     try:
         run(f"tail -f {LOG_FILE}")
     except KeyboardInterrupt:
         print(f"\n\n[INFO] Stopped watching. Training continues in background.")
-        print(f"[INFO] Watch again:    tail -f {LOG_FILE}")
-        print(f"[INFO] Check running:  ps aux | grep train.py")
-        print(f"\n[INFO] When done, download results:")
+        print(f"[INFO] Watch again:     tail -f {LOG_FILE}")
+        print(f"[INFO] Check running:   ps aux | grep train.py")
+        print(f"\n[INFO] When done, download results from your LOCAL terminal:")
         print(f"  scp -P PORT root@ssh.vast.ai:{OUTPUT_DIR}/inference/generated_epoch*.png .")
         print(f"  scp -P PORT root@ssh.vast.ai:{OUTPUT_DIR}/training_v6.log .")
-        print(f"  scp -P PORT root@ssh.vast.ai:{CKPT_DIR}/checkpoint_best.pt .")
+        print(f"  scp -P PORT root@ssh.vast.ai:{OUTPUT_DIR}/checkpoints/checkpoint_best.pt .")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
