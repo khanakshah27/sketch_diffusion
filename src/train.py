@@ -73,27 +73,56 @@ CKPT_DIR   = OUTPUT_DIR / "checkpoints"
 INFER_DIR  = OUTPUT_DIR / "inference"
 VAL_DIR    = OUTPUT_DIR / "validation"
 
-# ── Hyperparameters ────────────────────────────────────────────────────────
-NUM_IMAGES       = int(os.environ.get("NUM_IMAGES",       "10000"))
-BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",       "16"))
-NUM_EPOCHS       = int(os.environ.get("NUM_EPOCHS",       "50"))
-# Lower peak LR — 3e-5 was slightly too aggressive for mid_block only fine-tuning
-LR               = float(os.environ.get("LR",             "2e-5"))
-# Accumulate 4 steps = effective batch 64 — smoother, more stable gradients
-GRAD_ACCUM_STEPS = int(os.environ.get("GRAD_ACCUM_STEPS", "4"))
+# ── Dataset mode — controls all hyperparameters automatically ──────────────
+# Set DATASET_MODE=10k for Flickr 10k run
+# Set DATASET_MODE=30k for Flickr 30k run
+# All hyperparameters auto-configure for best results on each dataset
+DATASET_MODE = os.environ.get("DATASET_MODE", "10k")
+
+if DATASET_MODE == "30k":
+    # ── 30k optimal config ─────────────────────────────────────────────────
+    # More data → larger batch, higher LR, more trainable params, fewer epochs
+    _NUM_IMAGES       = "31783"
+    _BATCH_SIZE       = "16"     # effective 64 with grad accum 4
+    _NUM_EPOCHS       = "15"     # 30k converges faster than 10k
+    _LR               = "2e-5"   # higher LR justified with 3x more data
+    _GRAD_ACCUM       = "4"      # effective batch = 64
+    _TIMESTEP_BIAS    = "0.85"
+    _SNR_GAMMA        = "5.0"    # standard gamma — more data handles noisier steps
+    _TRAIN_CN_BLOCKS  = {"down_blocks.3", "mid_block"}  # ~28M — affordable on 30k
+    _EARLY_STOP       = "4"
+    _VAL_EVERY        = "3"
+else:
+    # ── 10k optimal config ─────────────────────────────────────────────────
+    # Less data → smaller batch, lower LR, fewer trainable params, more epochs
+    _NUM_IMAGES       = "10000"
+    _BATCH_SIZE       = "8"      # effective 32 with grad accum 4 — prevents overfitting
+    _NUM_EPOCHS       = "25"     # beyond 25 on 10k = overfitting territory
+    _LR               = "1e-5"   # lower LR for small dataset stability
+    _GRAD_ACCUM       = "4"      # effective batch = 32
+    _TIMESTEP_BIAS    = "0.85"
+    _SNR_GAMMA        = "3.0"    # more aggressive — down-weights noisy steps harder
+    _TRAIN_CN_BLOCKS  = {"mid_block"}  # ~5M only — prevents overfitting on 10k
+    _EARLY_STOP       = "5"
+    _VAL_EVERY        = "3"
+
+# All overridable via environment variables
+NUM_IMAGES       = int(os.environ.get("NUM_IMAGES",       _NUM_IMAGES))
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",       _BATCH_SIZE))
+NUM_EPOCHS       = int(os.environ.get("NUM_EPOCHS",       _NUM_EPOCHS))
+LR               = float(os.environ.get("LR",             _LR))
+GRAD_ACCUM_STEPS = int(os.environ.get("GRAD_ACCUM_STEPS", _GRAD_ACCUM))
 NUM_WORKERS      = int(os.environ.get("NUM_WORKERS",      "4"))
-# 85% low-noise steps (was 80%) — more focus on informative timesteps
-TIMESTEP_BIAS    = float(os.environ.get("TIMESTEP_BIAS",  "0.85"))
-RESUME_CKPT      = os.environ.get("RESUME_CKPT",          "auto")  # 'auto' finds latest
+TIMESTEP_BIAS    = float(os.environ.get("TIMESTEP_BIAS",  _TIMESTEP_BIAS))
+RESUME_CKPT      = os.environ.get("RESUME_CKPT",          "auto")
 EMA_DECAY        = float(os.environ.get("EMA_DECAY",      "0.9995"))
-# SNR gamma=3 (was 5) — more aggressive down-weighting of noisy timesteps
-SNR_GAMMA        = float(os.environ.get("SNR_GAMMA",      "3.0"))
-VAL_EVERY        = int(os.environ.get("VAL_EVERY",        "3"))
+SNR_GAMMA        = float(os.environ.get("SNR_GAMMA",      _SNR_GAMMA))
+VAL_EVERY        = int(os.environ.get("VAL_EVERY",        _VAL_EVERY))
 VAL_IMAGES       = int(os.environ.get("VAL_IMAGES",       "32"))
 VAL_STEPS        = int(os.environ.get("VAL_STEPS",        "20"))
-EARLY_STOP_PAT   = int(os.environ.get("EARLY_STOP_PAT",   "5"))
+EARLY_STOP_PAT   = int(os.environ.get("EARLY_STOP_PAT",   _EARLY_STOP))
 
-# ── Model config ────────────────────────────────────────────────────────────
+# ── Model config ─────────────────────────────────────────────────────────────
 SD_ID         = "runwayml/stable-diffusion-v1-5"
 CN_ID         = "lllyasviel/sd-controlnet-canny"
 COMPUTE_DTYPE = torch.bfloat16
@@ -104,10 +133,9 @@ VAE_SCALE     = 0.18215
 GRID_SIZE     = 8
 TEXT_DIM      = 768
 
-# KEY FIX: mid_block ONLY — ~5M params instead of 161M
-# Your v5 log showed noise MSE barely improved with 161M params on 10k images
-# mid_block is the single highest-impact layer for semantic adaptation
-TRAIN_CN_BLOCKS = {"mid_block"}
+# Trainable ControlNet blocks — set by dataset mode above
+TRAIN_CN_BLOCKS = set(os.environ.get("TRAIN_CN_BLOCKS", "").split(",")) \
+                  if os.environ.get("TRAIN_CN_BLOCKS") else _TRAIN_CN_BLOCKS
 
 
 ###########################################################################
@@ -173,10 +201,29 @@ def compute_snr(scheduler, timesteps):
 
 
 def snr_weighted_loss(pred, target, timesteps, scheduler, gamma=5.0):
+    """
+    SNR-weighted Huber Loss (smooth L1, delta=1.0).
+
+    Why Huber over MSE for sketch-to-image:
+      - Sketch conditioning leaves regions ambiguous (backgrounds, textures)
+        where large errors are expected and normal — MSE squares these,
+        causing them to dominate training and destabilise gradients
+      - Huber is quadratic (like MSE) for small errors and linear (like MAE)
+        for large errors — robust to outliers without ignoring them
+      - Used in ControlNet v1.1 fine-tuning and InstructPix2Pix officially
+      - Particularly suited to region-aware architectures where local
+        region-text misalignment can cause occasional large local errors
+
+    Why SNR weighting on top:
+      - Focuses training on low-noise timesteps where gradient signal
+        is most informative for structural conditioning tasks
+    """
     snr     = compute_snr(scheduler, timesteps)
     weights = torch.clamp(snr, max=gamma) / snr
     weights = weights.view(-1, 1, 1, 1).to(pred.device)
-    loss    = F.mse_loss(pred.float(), target.float(), reduction="none")
+    # smooth_l1_loss with beta=1.0 == Huber loss with delta=1.0
+    loss    = F.smooth_l1_loss(pred.float(), target.float(),
+                               reduction="none", beta=1.0)
     return (loss * weights).mean()
 
 
@@ -683,10 +730,13 @@ def print_metrics(metrics_log, final_noise, final_img,
 def main():
     print("=" * 60)
     print("DUAL-STAGE REGION-AWARE DIFFUSION v6")
-    print(f"  KEY CHANGE: mid_block only (~5M vs 161M in v5)")
+    print(f"  Dataset mode:   {DATASET_MODE} ({NUM_IMAGES} images)")
+    print(f"  Loss function:  SNR-weighted Huber (delta=1.0, gamma={SNR_GAMMA})")
+    print(f"  Trainable CN:   {TRAIN_CN_BLOCKS}")
+    print(f"  Batch:          {BATCH_SIZE} x {GRAD_ACCUM_STEPS} accum = "
+          f"{BATCH_SIZE * GRAD_ACCUM_STEPS} effective")
+    print(f"  Epochs: {NUM_EPOCHS} | LR: {LR} | Timestep bias: {TIMESTEP_BIAS}")
     print(f"  Targets: img_MSE<0.1 | img_PSNR>18dB | img_SSIM>0.6")
-    print(f"  Images: {NUM_IMAGES} | Epochs: {NUM_EPOCHS} | "
-          f"Batch: {BATCH_SIZE} | LR: {LR}")
     print(f"  Val every {VAL_EVERY} epochs | {VAL_IMAGES} images | skimage SSIM")
     print("=" * 60)
 
