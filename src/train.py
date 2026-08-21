@@ -819,8 +819,9 @@ def main():
     val_pipe = build_val_pipeline(m, ema_cn, sched, device)
 
     print(f"\n[TRAIN] Epochs {start_epoch+1}→{NUM_EPOCHS} | {IMAGE_SIZE}px")
-    print(f"        mid_block only | SNR loss | EMA | bfloat16 backbone")
-    print(f"        Disk-safe checkpointing | Auto-resume")
+    print(f"        Trainable blocks: {TRAIN_CN_BLOCKS}")
+    print(f"        Loss: SNR-weighted Huber | EMA decay: {EMA_DECAY}")
+    print(f"        bfloat16 backbone | Disk-safe checkpointing | Auto-resume")
     print("-" * 60)
 
     t_train      = time.time()
@@ -837,7 +838,18 @@ def main():
     for epoch in range(start_epoch + 1, NUM_EPOCHS + 1):
         ep_noise_mse = ep_noise_mae = 0.0
         ep_grad_norm = 0.0
-        steps = 0
+        steps        = 0
+        ep_start     = time.time()
+
+        # ── Epoch header ──────────────────────────────────────────────────
+        print(f"\n{'='*60}")
+        print(f"  EPOCH {epoch}/{NUM_EPOCHS} starting...")
+        print(f"  Dataset: {DATASET_MODE} | Batch: {BATCH_SIZE} | "
+              f"Eff. batch: {BATCH_SIZE * GRAD_ACCUM_STEPS}")
+        print(f"  LR: {opt.param_groups[0]['lr']:.2e} | "
+              f"Total steps this epoch: {len(all_batches)}")
+        print(f"  Optimizer steps per epoch: {len(all_batches) // GRAD_ACCUM_STEPS}")
+        print(f"{'='*60}")
 
         m["cn"].train(); m["re"].train(); m["sa"].train(); m["unet"].train()
 
@@ -848,19 +860,23 @@ def main():
             bs    = imgs.shape[0]
             total_imgs += bs
 
+            # Step 1: VAE encode
             with torch.no_grad():
                 latents = m["vae"].encode(imgs).latent_dist.sample() * VAE_SCALE
 
+            # Step 2: Add noise
             noise     = torch.randn_like(latents)
             ts        = sample_timesteps(bs, device)
             noisy_lat = sched.add_noise(latents, noise, ts)
 
+            # Step 3: Text encode
             with torch.no_grad():
                 ids     = m["tok"](list(caps), padding="max_length",
                                     max_length=MAX_TOK, truncation=True,
                                     return_tensors="pt").input_ids.to(device)
                 txt_emb = m["te"](ids)[0]
 
+            # Step 4: Forward pass
             with autocast_ctx:
                 down_res, mid_res = m["cn"](
                     sample=noisy_lat, timestep=ts,
@@ -883,15 +899,21 @@ def main():
                     noise_pred, noise, ts, sched, gamma=SNR_GAMMA
                 ) / GRAD_ACCUM_STEPS
 
+            # NaN check
             if torch.isnan(loss) or torch.isinf(loss):
                 nan_count += 1
+                print(f"  [WARN] Step {batch_idx+1}: NaN/Inf loss detected — "
+                      f"skipping this batch (total skipped: {nan_count})")
                 opt.zero_grad()
                 continue
 
+            # Step 5: Backward
             loss.backward()
 
-            if ((batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or
-                    batch_idx == len(all_batches) - 1):
+            # Step 6: Optimizer step (every GRAD_ACCUM_STEPS batches)
+            is_opt_step = ((batch_idx + 1) % GRAD_ACCUM_STEPS == 0 or
+                           batch_idx == len(all_batches) - 1)
+            if is_opt_step:
                 gn = torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                 ep_grad_norm += gn.item()
                 opt.step()
@@ -905,6 +927,32 @@ def main():
             ep_noise_mae += nm["noise_MAE"]
             steps        += 1
 
+            # ── Progress print every 50 batches ───────────────────────────
+            if (batch_idx + 1) % 50 == 0 or batch_idx == len(all_batches) - 1:
+                elapsed      = time.time() - ep_start
+                pct          = 100 * (batch_idx + 1) / len(all_batches)
+                avg_mse      = ep_noise_mse / steps
+                avg_mae      = ep_noise_mae / steps
+                imgs_done    = (batch_idx + 1) * BATCH_SIZE
+                throughput   = imgs_done / elapsed if elapsed > 0 else 0
+                eta_secs     = (elapsed / (batch_idx + 1)) * (len(all_batches) - batch_idx - 1)
+                vram_used    = torch.cuda.memory_allocated() / 1e9 if device == "cuda" else 0
+                vram_total   = torch.cuda.get_device_properties(0).total_memory / 1e9 \
+                               if device == "cuda" else 0
+
+                print(f"  [Ep {epoch} | {pct:5.1f}%] "
+                      f"Batch {batch_idx+1}/{len(all_batches)} | "
+                      f"nMSE={avg_mse:.4f} | "
+                      f"nMAE={avg_mae:.4f} | "
+                      f"Loss={loss.item()*GRAD_ACCUM_STEPS:.4f} | "
+                      f"gStep={global_step} | "
+                      f"LR={opt.param_groups[0]['lr']:.2e} | "
+                      f"VRAM={vram_used:.1f}/{vram_total:.0f}GB | "
+                      f"Speed={throughput:.1f}img/s | "
+                      f"ETA={eta_secs/60:.1f}min")
+
+        # ── Epoch summary ─────────────────────────────────────────────────
+        ep_time = time.time() - ep_start
         if steps > 0:
             last_noise_m = {
                 "noise_MSE": ep_noise_mse / steps,
@@ -912,49 +960,68 @@ def main():
                 "grad_norm": ep_grad_norm / max(1, steps // GRAD_ACCUM_STEPS),
             }
 
+        print(f"\n  ── EPOCH {epoch} SUMMARY ──────────────────────────────")
+        print(f"  Time:        {ep_time/60:.1f} min "
+              f"({ep_time:.0f}s)")
+        print(f"  Noise MSE:   {last_noise_m.get('noise_MSE',0):.6f}  "
+              f"← lower is better (training signal)")
+        print(f"  Noise MAE:   {last_noise_m.get('noise_MAE',0):.6f}")
+        print(f"  Grad norm:   {last_noise_m.get('grad_norm',0):.4f}  "
+              f"← should be <1.0 (gradient clipping applied)")
+        print(f"  NaN steps:   {nan_count} total skipped")
+        print(f"  Global step: {global_step}")
+        print(f"  LR now:      {opt.param_groups[0]['lr']:.2e}")
+        print(f"  Images seen: {total_imgs:,} total")
+
+        # ── Validation ────────────────────────────────────────────────────
         do_val      = (epoch % VAL_EVERY == 0 or epoch == NUM_EPOCHS)
         targets_met = False
 
         if do_val:
-            print(f"\n[VAL] Epoch {epoch} — image-space metrics on {VAL_IMAGES} images...")
+            print(f"\n  [VAL] Running image-space validation on {VAL_IMAGES} images...")
+            print(f"  [VAL] Generating images using EMA weights + full pipeline...")
+            val_start  = time.time()
             update_val_pipeline(val_pipe, ema_cn)
             m["cn"].eval(); m["unet"].eval()
             last_img_m = run_validation(val_pipe, val_batch, epoch, device)
             m["cn"].train(); m["unet"].train()
+            val_time   = time.time() - val_start
 
             targets_met = (
                 last_img_m.get("img_MSE",  1) < 0.1 and
                 last_img_m.get("img_PSNR", 0) > 18  and
                 last_img_m.get("img_SSIM", 0) > 0.6
             )
-            val_str = (
-                f"iMSE={last_img_m['img_MSE']:.4f} | "
-                f"iPSNR={last_img_m['img_PSNR']:.2f}dB | "
-                f"iSSIM={last_img_m['img_SSIM']:.4f}"
-                + (" 🎯 ALL TARGETS MET" if targets_met else "")
-            )
+
+            print(f"\n  [VAL] Results (epoch {epoch}) — took {val_time/60:.1f} min:")
+            print(f"  ┌─────────────────────────────────────────────────┐")
+            print(f"  │  img MSE:  {last_img_m['img_MSE']:.6f}   "
+                  f"target < 0.1   {'✅' if last_img_m['img_MSE']<0.1 else '❌'}")
+            print(f"  │  img MAE:  {last_img_m['img_MAE']:.6f}   "
+                  f"target < 0.3   {'✅' if last_img_m['img_MAE']<0.3 else '❌'}")
+            print(f"  │  img PSNR: {last_img_m['img_PSNR']:.4f} dB  "
+                  f"target > 18dB  {'✅' if last_img_m['img_PSNR']>18 else '❌'}")
+            print(f"  │  img SSIM: {last_img_m['img_SSIM']:.6f}   "
+                  f"target > 0.6   {'✅' if last_img_m['img_SSIM']>0.6 else '❌'}")
+            print(f"  └─────────────────────────────────────────────────┘")
+            print(f"  Val images saved to: {VAL_DIR}/val_ep{epoch}_*.png")
+
+            if targets_met:
+                print(f"\n  🎯 ALL TARGETS MET at epoch {epoch}!")
         else:
             nxt = ((epoch // VAL_EVERY) + 1) * VAL_EVERY
-            val_str = f"(next val: ep {nxt})"
+            print(f"\n  [VAL] Skipped this epoch — next validation at epoch {nxt}")
 
         row = {"epoch": epoch, **last_noise_m, **last_img_m}
         metrics_log.append(row)
 
-        print(f"  Ep {epoch}/{NUM_EPOCHS} | "
-              f"nMSE={last_noise_m.get('noise_MSE',0):.4f} | "
-              f"nMAE={last_noise_m.get('noise_MAE',0):.4f} | "
-              f"gNorm={last_noise_m.get('grad_norm',0):.3f} | "
-              f"{val_str} | "
-              f"LR={opt.param_groups[0]['lr']:.2e} | "
-              f"{time.time()-t_train:.0f}s")
-
-        # Save latest (stripped, small) every epoch
+        # ── Checkpoint ────────────────────────────────────────────────────
+        print(f"\n  [CKPT] Saving latest checkpoint...")
         save_checkpoint(m, ema_cn, opt, epoch,
                         {**last_noise_m, **last_img_m},
                         CKPT_DIR / "checkpoint_latest.pt",
                         strip_optimizer=True)
 
-        # Save best (full, with optimizer) based on image-space MSE
         if do_val:
             cur = last_img_m.get("img_MSE", 1)
             if cur < best_img_mse:
@@ -964,19 +1031,28 @@ def main():
                                 {**last_noise_m, **last_img_m},
                                 CKPT_DIR / "checkpoint_best.pt",
                                 strip_optimizer=False)
-                print(f"  ★ Best img_MSE={best_img_mse:.6f} → checkpoint_best.pt")
+                print(f"  ★ NEW BEST img_MSE={best_img_mse:.6f} "
+                      f"— saved as checkpoint_best.pt")
             else:
                 no_improve += 1
-                print(f"  No improvement ({no_improve}/{EARLY_STOP_PAT})")
+                print(f"  No improvement in img_MSE for {no_improve} "
+                      f"val cycles (patience: {EARLY_STOP_PAT})")
+                print(f"  Best so far: {best_img_mse:.6f}")
 
             if epoch >= 20 and no_improve >= EARLY_STOP_PAT:
-                print(f"\n[EARLY STOP] No improvement for {EARLY_STOP_PAT} val cycles. "
-                      f"Best img_MSE={best_img_mse:.6f}")
+                print(f"\n[EARLY STOP] No improvement for {EARLY_STOP_PAT} "
+                      f"consecutive val cycles.")
+                print(f"  Best img_MSE achieved: {best_img_mse:.6f}")
+                print(f"  Stopping at epoch {epoch} to prevent overfitting.")
                 break
 
             if targets_met and epoch >= 15:
-                print(f"\n[CONVERGED] All targets met at epoch {epoch}!")
+                print(f"\n[CONVERGED] All targets met at epoch {epoch}! Stopping.")
                 break
+
+        print(f"\n  Total elapsed: {(time.time()-t_train)/60:.1f} min | "
+              f"Epoch {epoch} done.")
+        print(f"{'─'*60}")
 
     # Final inference
     best_path = CKPT_DIR / "checkpoint_best.pt"
