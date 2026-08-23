@@ -800,7 +800,7 @@ def main():
     opt = AdamW(trainable, lr=LR, weight_decay=1e-4, betas=(0.9, 0.999))
 
     # OneCycleLR — better convergence for fine-tuning than cosine restarts
-    total_steps = NUM_EPOCHS * (len(all_batches) // GRAD_ACCUM_STEPS)
+    total_steps = int(NUM_EPOCHS * (len(all_batches) // GRAD_ACCUM_STEPS) * 1.05) + 100
     lr_sched    = OneCycleLR(
         opt, max_lr=LR,
         total_steps=total_steps,
