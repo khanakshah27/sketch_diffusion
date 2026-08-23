@@ -763,15 +763,12 @@ def main():
                                NUM_WORKERS, NUM_IMAGES, val=False)
     val_loader   = make_loader(CSV_PATH, IMAGE_ROOT, VAL_IMAGES, 0, val=True)
 
-    print(f"[DATA] Caching {NUM_IMAGES} training batches...")
-    all_batches, loaded = [], 0
-    for b in train_loader:
-        all_batches.append(b)
-        loaded += b["image"].shape[0]
-        if loaded >= NUM_IMAGES:
-            break
-    print(f"[DATA] {loaded} images in {len(all_batches)} batches")
-
+   # For large datasets don't cache — iterate loader directly each epoch
+    print(f"[DATA] Using streaming mode for {NUM_IMAGES} images")
+    print(f"[DATA] {len(train_loader)} batches per epoch")
+    all_batches = train_loader  # stream directly, no caching
+    loaded = NUM_IMAGES
+    print(f"[DATA] Ready — streaming {loaded} images per epoch")
     val_batches = list(val_loader)
     val_batch   = val_batches[0] if val_batches else all_batches[0]
     print(f"[VAL]  {len(val_batch['image'])} validation images")
