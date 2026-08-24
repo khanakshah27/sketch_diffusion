@@ -1060,7 +1060,8 @@ def main():
         update_val_pipeline(val_pipe, ema_cn)
 
     m["cn"].eval(); m["unet"].eval()
-    run_inference(val_pipe, all_batches[0], NUM_EPOCHS)
+    sample_batch = next(iter(all_batches))
+    run_inference(val_pipe, sample_batch, NUM_EPOCHS)
 
     t_end      = time.time()
     train_dur  = t_end - t_train
