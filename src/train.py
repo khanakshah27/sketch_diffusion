@@ -763,12 +763,15 @@ def main():
                                NUM_WORKERS, NUM_IMAGES, val=False)
     val_loader   = make_loader(CSV_PATH, IMAGE_ROOT, VAL_IMAGES, 0, val=True)
 
-   # For large datasets don't cache — iterate loader directly each epoch
-    print(f"[DATA] Using streaming mode for {NUM_IMAGES} images")
-    print(f"[DATA] {len(train_loader)} batches per epoch")
-    all_batches = train_loader  # stream directly, no caching
-    loaded = NUM_IMAGES
-    print(f"[DATA] Ready — streaming {loaded} images per epoch")
+    print(f"[DATA] Caching {NUM_IMAGES} training batches...")
+    all_batches, loaded = [], 0
+    for b in train_loader:
+        all_batches.append(b)
+        loaded += b["image"].shape[0]
+        if loaded >= NUM_IMAGES:
+            break
+    print(f"[DATA] {loaded} images in {len(all_batches)} batches")
+
     val_batches = list(val_loader)
     val_batch   = val_batches[0] if val_batches else all_batches[0]
     print(f"[VAL]  {len(val_batch['image'])} validation images")
@@ -797,7 +800,7 @@ def main():
     opt = AdamW(trainable, lr=LR, weight_decay=1e-4, betas=(0.9, 0.999))
 
     # OneCycleLR — better convergence for fine-tuning than cosine restarts
-    total_steps = int(NUM_EPOCHS * (len(all_batches) // GRAD_ACCUM_STEPS) * 1.05) + 100
+    total_steps = NUM_EPOCHS * (len(all_batches) // GRAD_ACCUM_STEPS)
     lr_sched    = OneCycleLR(
         opt, max_lr=LR,
         total_steps=total_steps,
@@ -1060,8 +1063,7 @@ def main():
         update_val_pipeline(val_pipe, ema_cn)
 
     m["cn"].eval(); m["unet"].eval()
-    sample_batch = next(iter(all_batches))
-    run_inference(val_pipe, sample_batch, NUM_EPOCHS)
+    run_inference(val_pipe, all_batches[0], NUM_EPOCHS)
 
     t_end      = time.time()
     train_dur  = t_end - t_train
@@ -1080,3 +1082,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# NOTE: evaluate.py is called automatically by autorun.py after training completes
+# It computes FID, CLIPScore, LPIPS, DINO similarity and baseline comparisons
