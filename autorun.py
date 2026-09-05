@@ -51,9 +51,10 @@ GCLOUD_INIT   = Path("/root/google-cloud-sdk/path.bash.inc")
 # ── GitHub repo — code files downloaded automatically ─────────────────────
 GITHUB_RAW    = "https://raw.githubusercontent.com/khanakshah27/sketch_diffusion/main"
 GITHUB_FILES  = {
-    "/train.py":     f"{GITHUB_RAW}/src/train.py",
-    "/convert.py":   f"{GITHUB_RAW}/src/convert.py",
-    "/inference.py": f"{GITHUB_RAW}/src/inference.py",
+    "/train.py":      f"{GITHUB_RAW}/src/train.py",
+    "/convert.py":    f"{GITHUB_RAW}/src/convert.py",
+    "/inference.py":  f"{GITHUB_RAW}/src/inference.py",
+    "/evaluate.py":   f"{GITHUB_RAW}/src/evaluate.py",
 }
 
 # ── Per-dataset config ─────────────────────────────────────────────────────
@@ -342,6 +343,8 @@ def install_dependencies():
     run("pip install accelerate einops pandas Pillow --quiet")
     run("pip install opencv-python-headless scikit-image --quiet")
     run("pip install xformers --quiet", check=False)
+    # Evaluation metrics packages
+    run("pip install lpips clean-fid open_clip_torch --quiet", check=False)
     run("python -c \"import torch; print('PyTorch:', torch.__version__)\"")
     run("python -c \"import diffusers; print('diffusers:', diffusers.__version__)\"")
     print("[OK] All dependencies installed.")
@@ -616,6 +619,21 @@ def main():
     else:
         start_training()
         tail_log()
+        # After training finishes, run evaluation automatically
+        if DATASET_MODE == "30k":
+            section("POST-TRAINING: Running Comprehensive Evaluation")
+            print("[INFO] Training complete. Running FID/LPIPS/CLIPScore/DINO evaluation...")
+            run(
+                f"CHECKPOINT_PATH={OUTPUT_DIR}/checkpoints/checkpoint_best.pt "
+                f"CSV_PATH={CAPTIONS_CSV} "
+                f"IMAGE_ROOT={IMAGE_DIR} "
+                f"OUTPUT_DIR={OUTPUT_DIR} "
+                f"DATASET_MODE=30k "
+                f"python /evaluate.py > {OUTPUT_DIR}/evaluation.log 2>&1",
+                check=False
+            )
+            print(f"[INFO] Evaluation log: {OUTPUT_DIR}/evaluation.log")
+            print(f"[INFO] Results: {OUTPUT_DIR}/evaluation/metrics_summary.txt")
 
 
 if __name__ == "__main__":
